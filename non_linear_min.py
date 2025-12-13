@@ -1,193 +1,202 @@
-from rosenbrock import rosenbrock
-from grad import grad_c, jacobian_c
-from typing import Tuple, Callable
 import numpy as np
-from warnings import warn
+from typing import Callable, Tuple
+from rosenbrock import *
 
 
 def non_linear_min(
-    f: Callable[[np.ndarray], float],
+    f_orig: Callable[[np.ndarray], float],
     x0: np.ndarray,
     method: str,
     tol: float,
     restart: bool,
     printout: bool,
-    plot=False,
 ) -> Tuple[np.ndarray, int, int, float]:
-    """Minimizes an objective function using different non-linear methods.
-
-    Implements quasi-Newton methods for unconstrained optimization. The function
-    minimizes a scalar-valued objective function starting from an initial guess
-    using either DFP or BFGS updating schemes.
+    """
+    Nonlinear optimization using DFP or BFGS quasi-Newton methods.
 
     Args:
-        f: Objective function to be minimized. Must accept a 1D numpy array
-           and return a float.
-        x0: Initial guess for the minimum. Should be a 1D numpy array.
-        method: Minimization method to use. Options are:
-            - "DFP": Davidon-Fletcher-Powell method
-            - "BFGS": Broyden-Fletcher-Goldfarb-Shanno method
-        tol: Termination tolerance. Algorithm stops when the gradient norm
-             falls below this value.
-        restart: Whether to restart the minimization if the Hessian approximation
-                 becomes non-positive definite. If True, resets the Hessian to
-                 identity and continues.
-        printout: If True, prints iteration progress and final results.
+        f : Callable
+            Objective function
+        x0 : np.ndarray
+            Initial guess
+        method : str
+            "DFP" or "BFGS"
+        tol : float
+            Convergence tolerance for gradient norm
+        restart : bool
+            If True, reset Hessian approximation to identity if something goes wrong
+        printout : bool
+            If True, print iteration information
 
     Returns:
-        A tuple containing:
-            - sol: Solution x* that minimizes the objective function
-            - N_eval: Number of function evaluations performed
-            - N_iter: Number of iterations completed
-            - normg: 2-norm of the gradient at the solution x*
-
-    Raises:
-        ValueError: If method is not "DFP" or "BFGS".
-        ValueError: If x0 is not array-like
-        RuntimeError: If maximum iterations exceeded without convergence.
-
-    Examples:
-
-
-    Notes:
-
+        x : np.ndarray
+            Minimum x*
+        n_iter : int
+            Number of iterations
+        n_fval : int
+            Number of function evaluations
+        gnorm : float
+            Norm of function gradient at x*
     """
-    if method not in ["DFP", "BFGS"]:
-        raise ValueError(f"Unsupported optimization method {method}")
-    try:
-        x0 = np.array(
-            x0, float
-        )  # needs float conversion or the provided gradient function will not work
-    except Exception:
-        raise TypeError("Initial guess is unknown or cannot be converted to float")
-    if plot:
-        import matplotlib.pyplot as plt
+    calls = [0]
 
-        # Create grid
-        x_vals = np.linspace(-2, 2, 100)
-        y_vals = np.linspace(-1, 3, 100)
-        X, Y = np.meshgrid(x_vals, y_vals)
+    def f(x):
+        calls[0] += 1
+        return f_orig(x)
 
-        # Evaluate function at each grid point
-        Z = np.zeros_like(X)
-        for i in range(X.shape[0]):
-            for j in range(X.shape[1]):
-                Z[i, j] = f(np.array([X[i, j], Y[i, j]]))
+    # Parameters for Wolfe conditions
+    c1 = 1e-4
+    c2 = 0.9
 
-        # Plot
-        plt.figure(figsize=(10, 8))
-        contour = plt.contour(X, Y, Z, levels=30, cmap="viridis")
-    # variable initiazation:
-    max_iter = 100
-    iteration = 0
-    H = np.eye(x0.shape[0])
-    g = grad_c(f, x0)
-    x = x0.copy()
+    # HELPER FUNCTIONS
     norm = np.linalg.norm
 
-    def _linesearch(
-        f: Callable[[np.ndarray], float],
-        x: np.ndarray,
-        p: np.ndarray,
-        g: np.ndarray,
-    ) -> float:
-        """Helper function for line search
+    def grad_c(
+        f: Callable[[np.ndarray], float], x: np.ndarray, h: float = 1.0e-8
+    ) -> np.ndarray:
+        """
+        Calculates the gradient (numpy-1D-array) g of
+        function f with central differences
+        x is a numpy-1D-array, f(x) is a scalar
+        """
+        try:
+            assert len(x.shape) == 1
+        except:
+            raise ("grad.py, grad_c: x must be a 1D-numpy-array.")
+
+        inv_2h = 0.5 / h
+        lx = x.shape[0]
+        g = np.zeros(x.shape, x.dtype)
+
+        for i in range(lx):
+            hi = np.zeros(x.shape, x.dtype)
+            hi[i] = h
+            g[i] = (f(x + hi) - f(x - hi)) * inv_2h
+
+        return g
+
+    def _hesse(s, y, H, mthd) -> np.ndarray:
+        if mthd == "dfp":
+            Hy = H @ y
+            sTy = np.dot(s, y)
+            yTHy = np.dot(y, Hy)
+
+            if sTy > 1e-12:
+                return H - np.outer(Hy, Hy) / yTHy + np.outer(s, s) / sTy
+            return None  # if not pos. def.
+        if mthd == "bfgs":
+            rho = 1.0 / np.dot(y, s)
+
+            if rho > 0:
+                I_minus_rhosyT = np.eye(n) - rho * np.outer(s, y)
+                return I_minus_rhosyT @ H @ I_minus_rhosyT.T + rho * np.outer(s, s)
+            return None  # if not pos. def.
+        raise ValueError(f"Unknown update formula: {mthd}")
+
+    def _line_search(f, x, p, g) -> float:
+        """Line search function that satisfies Wolfe conditions, from Nocedal&Wright 2006 p. 59-60
         Args:
             f: Objective function
-            x: Starting point
+            x: Current point
             p: Search direction
-            g: Gradient at x
-            mthd: Search method. Options:
-                -"armijo": based on Armijo condition (default)
-                -"wolfe": based on Wolfe condition
-
-        Returns:
-            alpha: step size as a result of line seach
-        Raises:
-            RuntimeError: If step size is not found
+            fx: Objective function value at x
+            g: Objective function gradient at x
         """
-        m = np.sum(p * g)
-        if m > 0:
-            warn(
-                f"Invalid descent direction encountered during line search p.T@g={m:2f}>0",
-                RuntimeWarning,
-            )
         alpha = 1
-        tau = 0.5
-        c=1e-4
-        f_0 = f(x)
-        while f(x + alpha * p) > f_0 + c * m * alpha:
-            alpha *= tau
+        phi = lambda alpha: f(x + alpha * p)
+
+        def _zoom(alpha_lo, alpha_hi):
+            dphi_0 = np.dot(grad_c(f, x), p)
+
+            for _ in range(max_iter):
+                alpha_j = (alpha_lo + alpha_hi) / 2
+                phi_j = phi(alpha_j)
+                phi_0 = phi(0)
+                if phi_j > phi_0 + c1 * alpha_j * dphi_0 or phi_j >= phi(alpha_lo):
+                    alpha_hi = alpha_j
+                else:
+                    dphi_j = np.dot(grad_c(f, x + alpha_j * p), p)
+                    dphi_lo = np.dot(grad_c(f, x + alpha_lo * p), p)
+                    if np.abs(dphi_j) <= -c2 * dphi_lo:
+                        return alpha_j
+
+                    if dphi_j * (alpha_hi - alpha_lo) >= 0:
+                        alpha_hi = alpha_lo
+
+                    alpha_lo = alpha_j
+
+            return alpha_lo
+
+        dphi_0 = np.dot(g, p)
+        alpha_prev = 0.0
+        phi_prev = phi_0 = phi(0)
+
+        for i in range(max_iter):
+            phi_i = phi(alpha)
+
+            if phi_i > phi_0 + c1 * alpha * dphi_0 or (i > 0 and phi_i >= phi_prev):
+                return _zoom(alpha_prev, alpha)
+
+            dphi_i = np.dot(grad_c(f, x + alpha * p), p)
+
+            if np.abs(dphi_i) <= -c2 * dphi_0:
+                return alpha
+
+            if dphi_i >= 0:
+                return _zoom(alpha, alpha_prev)
+
+            alpha_prev = alpha
+            phi_prev = phi_i
+            alpha = alpha * 1.5
+
         return alpha
 
-    def _hesse(s: np.ndarray, y: np.ndarray, H: np.ndarray, mthd: str) -> np.ndarray:
-        """Helper function to update the Hesse matrix by some rule
-        Args:
-            s: Step difference
-            y: Gradient difference
-            H: Previous (inverse) Hesse matrix
-            mthd: Update method, "DFP" or "BFGS"
+    x = x0.copy()
+    n = len(x)
 
-        Returns:
-            H: Updated (inverse) Hesse matrix
-        """
-        if mthd not in ["DFP", "BFGS"]:
-            raise ValueError("Only DFP and BFGS are supported QN schemes")
-        curve = s.T @ y
+    g = grad_c(f, x)
 
-        if mthd == "DFP":
-            return (
-                H - H @ np.outer(y, y) @ H / (y.T @ H @ y) + np.outer(s, s) / (curve)
+    H = np.eye(n)
+
+    n_iter = 0
+    max_iter = 1000
+
+    if printout:
+        print(f"Iteration {n_iter}: f(x) = {f(x):.6e}, ||g|| = {np.linalg.norm(g):.6e}")
+
+    # Main optimization loop
+    while norm(g) > tol and n_iter < max_iter:
+        p = -H @ g
+        alpha = _line_search(f, x, p, g)
+        x_new = x + alpha * p
+        g_new = grad_c(f, x_new)
+
+        s = alpha * p
+        y = g_new - g
+
+        H = _hesse(s, y, H, method)
+        if H is None:
+            if restart:
+                H = np.eye(n)
+            else:
+                raise RuntimeError("Hesse matrix is not pos. def, consider restarting")
+
+        x = x_new
+        g = g_new
+        n_iter += 1
+
+        if printout:
+            print(
+                f"Iteration {n_iter}: f(x) = {f(x):.6e}, ||g|| = {np.linalg.norm(g):.6e}, alpha = {alpha}"
             )
-        if mthd == "BFGS":
-            rho = 1 / (curve)
-            I = np.eye(s.shape[0])
-            # first=(np.outer(s, y)+np.outer(y, H@y))@np.outer(s,s)/((s@y)**2)
-            # last=(H@np.outer(y, s)+np.outer(s, y)@H)/(s@y)
-            # return H+first-last
-            return (I - rho * s @ y.T) @ H @ (I - rho * y @ s.T) + rho * np.outer(s, s)
-        raise ValueError("Only DFP and BFGS are supported")
-
-    # Main iteration loop:
-    for _ in range(max_iter):
-        iteration += 1
-        d = -H @ g
-        if d.T@g>0:
-            H=np.eye(x.shape[0])
-            d=-g
-            print(f"Reset Hesse matrix due to invalid descent direction") if printout else None
-        alpha = _linesearch(f, x, d, g)
-        new_x = x + alpha * d
-        if plot:
-            plt.plot([x[0], new_x[0]], [x[1], new_x[1]], "-b")
-        new_g = grad_c(f, new_x)
-        s = alpha*d
-        y = new_g - g
-        #Curvature condition check:
-        curve=s.T@y
-        if curve>0:
-            H = _hesse(s, y, H, method)
-            print(f"Updated Hess matrix according to {method} method") if printout else None
-        elif restart:
-            H=np.eye(x.shape[0])
-            print("Curvature condition failed, reset Hesse matrix to identity") if printout else None
-        else:
-            print("Curvature condition falied!!") if printout else None
-        x = new_x
-        g = grad_c(f, x)
-        if norm(g) < tol:
-            # optional plot:
-            if plot:
-                plt.plot(x[0], x[1], "x")
-                plt.show()
-            return x, 0, 0, np.linalg.norm(g)
-    raise RuntimeError(f"QN did not converge after {max_iter} iterations")
+    return (
+        x,
+        calls[0],
+        n_iter,
+        f(x),
+    )
 
 
 if __name__ == "__main__":
-    for _ in range(1):
-        start = np.random.rand(2) * 10
-        tol = 1e-5
-        f = lambda x: np.sum(x**2)
-        print(non_linear_min(rosenbrock, start, "DFP", tol, True, True, False))
-        print(non_linear_min(rosenbrock, start, "BFGS", tol, True, True, False))
+    f = lambda x: np.sum(x**2)
+    print(non_linear_min(rosenbrock, np.random.rand(2) * 100, "bfgs", 1e-5, True, True))
