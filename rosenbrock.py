@@ -1,14 +1,6 @@
 
 import numpy as np
 
-
-def call_counter(func):
-    def helper(x):
-        helper.calls += 1
-        return func(x)
-    helper.calls = 0
-    return helper
-@call_counter
 def rosenbrock(x : np.ndarray) -> float:
     """
     Evaluates Rosenbrock's function for a numpy-array x

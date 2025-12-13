@@ -1,10 +1,11 @@
 import numpy as np
 from typing import Callable, Tuple
 from rosenbrock import *
+from grad import grad_c
 
 
 def non_linear_min(
-    f_orig: Callable[[np.ndarray], float],
+    f: Callable[[np.ndarray], float],
     x0: np.ndarray,
     method: str,
     tol: float,
@@ -38,42 +39,16 @@ def non_linear_min(
         gnorm : float
             Norm of function gradient at x*
     """
-    calls = [0]
-
-    def f(x):
-        calls[0] += 1
-        return f_orig(x)
-
-    # Parameters for Wolfe conditions
+    
     c1 = 1e-4
     c2 = 0.9
 
+    n_iter = 0
+    max_iter = 1000
+
+    calls=0
     # HELPER FUNCTIONS
     norm = np.linalg.norm
-
-    def grad_c(
-        f: Callable[[np.ndarray], float], x: np.ndarray, h: float = 1.0e-8
-    ) -> np.ndarray:
-        """
-        Calculates the gradient (numpy-1D-array) g of
-        function f with central differences
-        x is a numpy-1D-array, f(x) is a scalar
-        """
-        try:
-            assert len(x.shape) == 1
-        except:
-            raise ("grad.py, grad_c: x must be a 1D-numpy-array.")
-
-        inv_2h = 0.5 / h
-        lx = x.shape[0]
-        g = np.zeros(x.shape, x.dtype)
-
-        for i in range(lx):
-            hi = np.zeros(x.shape, x.dtype)
-            hi[i] = h
-            g[i] = (f(x + hi) - f(x - hi)) * inv_2h
-
-        return g
 
     def _hesse(s, y, H, mthd) -> np.ndarray:
         if mthd == "dfp":
@@ -93,7 +68,7 @@ def non_linear_min(
             return None  # if not pos. def.
         raise ValueError(f"Unknown update formula: {mthd}")
 
-    def _line_search(f, x, p, g) -> float:
+    def _line_search(f, x, p, g, lcalls) -> float:
         """Line search function that satisfies Wolfe conditions, from Nocedal&Wright 2006 p. 59-60
         Args:
             f: Objective function
@@ -105,71 +80,73 @@ def non_linear_min(
         alpha = 1
         phi = lambda alpha: f(x + alpha * p)
 
-        def _zoom(alpha_lo, alpha_hi):
-            dphi_0 = np.dot(grad_c(f, x), p)
+        def _zoom(alpha_lo, alpha_hi,phi_alpha_lo, phi_0, dphi_0, zcalls):
 
             for _ in range(max_iter):
                 alpha_j = (alpha_lo + alpha_hi) / 2
                 phi_j = phi(alpha_j)
-                phi_0 = phi(0)
-                if phi_j > phi_0 + c1 * alpha_j * dphi_0 or phi_j >= phi(alpha_lo):
+                zcalls+=1
+                if phi_j > phi_0 + c1 * alpha_j * dphi_0 or phi_j >= phi_alpha_lo:
                     alpha_hi = alpha_j
                 else:
                     dphi_j = np.dot(grad_c(f, x + alpha_j * p), p)
+                    zcalls+=2*n
                     dphi_lo = np.dot(grad_c(f, x + alpha_lo * p), p)
+                    zcalls+=2*n
                     if np.abs(dphi_j) <= -c2 * dphi_lo:
-                        return alpha_j
+                        return alpha_j, zcalls
 
                     if dphi_j * (alpha_hi - alpha_lo) >= 0:
                         alpha_hi = alpha_lo
 
                     alpha_lo = alpha_j
 
-            return alpha_lo
+            return alpha_lo, zcalls
 
         dphi_0 = np.dot(g, p)
         alpha_prev = 0.0
         phi_prev = phi_0 = phi(0)
-
+        lcalls+=1
         for i in range(max_iter):
             phi_i = phi(alpha)
-
+            lcalls+=1
             if phi_i > phi_0 + c1 * alpha * dphi_0 or (i > 0 and phi_i >= phi_prev):
-                return _zoom(alpha_prev, alpha)
+                return _zoom(alpha_prev, alpha,phi_prev, phi_0,dphi_0, lcalls)
 
             dphi_i = np.dot(grad_c(f, x + alpha * p), p)
-
+            lcalls+=2*n
             if np.abs(dphi_i) <= -c2 * dphi_0:
-                return alpha
+                return alpha, lcalls
 
             if dphi_i >= 0:
-                return _zoom(alpha, alpha_prev)
+                return _zoom(alpha, alpha_prev,phi_prev,phi_0, dphi_0, lcalls)
 
             alpha_prev = alpha
             phi_prev = phi_i
             alpha = alpha * 1.5
 
-        return alpha
+        return alpha, lcalls
 
     x = x0.copy()
     n = len(x)
 
     g = grad_c(f, x)
+    calls+=2*n
 
     H = np.eye(n)
 
-    n_iter = 0
-    max_iter = 1000
-
     if printout:
         print(f"Iteration {n_iter}: f(x) = {f(x):.6e}, ||g|| = {np.linalg.norm(g):.6e}")
+        calls+=1
 
     # Main optimization loop
     while norm(g) > tol and n_iter < max_iter:
         p = -H @ g
-        alpha = _line_search(f, x, p, g)
+        alpha,calls= _line_search(f, x, p, g, calls)
+
         x_new = x + alpha * p
         g_new = grad_c(f, x_new)
+        calls+=2*n
 
         s = alpha * p
         y = g_new - g
@@ -189,9 +166,22 @@ def non_linear_min(
             print(
                 f"Iteration {n_iter}: f(x) = {f(x):.6e}, ||g|| = {np.linalg.norm(g):.6e}, alpha = {alpha}"
             )
+            calls+=1
+    if printout:
+        if n_iter==max_iter:
+            print("="*10+"Minimization terminated unsucessfully" + "="*10)
+        else:
+            print("="*10+"Minimization finished" + "="*10)
+            print(f"x*={x}")
+            print(f"f(x*)={f(x)}")
+            calls+=1
+            print(f"2-norm of g={norm(g)}")
+            print(f"Minimization steps: {n_iter}")
+            print(f"Function calls: {calls+1}")
+            print("="*41)
     return (
         x,
-        calls[0],
+        calls+1,
         n_iter,
         f(x),
     )
