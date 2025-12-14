@@ -1,11 +1,104 @@
-import numpy as np
 from typing import Callable, Tuple
-from rosenbrock import *
+import numpy as np
 from grad import grad_c
+
+class _FuncCounter:
+    """Counts objective evaluations (including those inside finite-difference gradients)."""
+    def __init__(self, f: Callable[[np.ndarray], float]):
+        self.f = f
+        self.calls = 0
+
+    def __call__(self, x: np.ndarray) -> float:
+        self.calls += 1
+        return float(self.f(x))
+
+def _strong_wolfe_line_search(
+    f: _FuncCounter,
+    x: np.ndarray,
+    fx: float,
+    g: np.ndarray,
+    p: np.ndarray,
+    c1: float = 1e-4,
+    c2: float = 0.9,
+    alpha0: float = 1.0,
+    alpha_max: float = 50.0,
+    max_iter: int = 25,
+    max_zoom: int = 25,
+) -> Tuple[float, float, np.ndarray, int]:
+    """
+    wolfe line search (nocedal & wright style), using numerical gradients.
+    returns (alpha, f_new, g_new, ls_fun_evals).
+    """
+    calls_before = f.calls
+
+    phi0 = fx
+    dphi0 = float(np.dot(g, p))
+
+    #ensure descent direction, otherwise line search assumptions break.
+    if dphi0 >= 0.0:  #enforce descent
+        p = -g
+        dphi0 = -float(np.dot(g, g))
+
+    def phi(alpha: float) -> float:
+        return f(x + alpha * p)
+
+    def dphi(alpha: float) -> Tuple[float, np.ndarray]:
+        x_a = x + alpha * p
+        g_a = grad_c(f, x_a)
+        return float(np.dot(g_a, p)), g_a
+
+    def zoom(a_lo: float, a_hi: float, phi_lo: float) -> Tuple[float, float, np.ndarray]:
+        for _ in range(max_zoom):
+            a_j = 0.5 * (a_lo + a_hi)  #bisection (its robust)
+            phi_j = phi(a_j)
+
+            if (phi_j > phi0 + c1 * a_j * dphi0) or (phi_j >= phi_lo):
+                a_hi = a_j
+            else:
+                dphi_j, g_j = dphi(a_j)
+                if abs(dphi_j) <= -c2 * dphi0:
+                    return a_j, phi_j, g_j
+                #if derivative has wrong sign, swap bracket endpoint
+                if dphi_j * (a_hi - a_lo) >= 0.0:
+                    a_hi = a_lo
+                a_lo = a_j
+                phi_lo = phi_j
+
+        #fallback: return best known low point
+        dphi_lo, g_lo = dphi(a_lo)
+        return a_lo, phi(a_lo), g_lo  #recompute phi for consistency
+
+    a_prev = 0.0
+    phi_prev = phi0
+    a = float(alpha0)
+
+    for i in range(max_iter):
+        phi_a = phi(a)
+
+        if (phi_a > phi0 + c1 * a * dphi0) or (i > 0 and phi_a >= phi_prev):
+            a_star, f_star, g_star = zoom(min(a_prev, a), max(a_prev, a), phi_prev if a_prev < a else phi_a)  # FIX: ordered bracket
+            return a_star, f_star, g_star, f.calls - calls_before
+
+        dphi_a, g_a = dphi(a)
+
+        if abs(dphi_a) <= -c2 * dphi0:
+            return a, phi_a, g_a, f.calls - calls_before
+
+        if dphi_a >= 0.0:
+            a_star, f_star, g_star = zoom(min(a, a_prev), max(a, a_prev), phi_a if a < a_prev else phi_prev)  # FIX: ordered bracket
+            return a_star, f_star, g_star, f.calls - calls_before
+
+        a_prev = a
+        phi_prev = phi_a
+        a = min(2.0 * a, alpha_max)  #grow step
+
+    #if we get here, accept last tried step (best-effort)
+    dphi_a, g_a = dphi(a)
+    return a, phi(a), g_a, f.calls - calls_before
 
 
 def non_linear_min(
-    f: Callable[[np.ndarray], float],
+    f_orig: Callable[[np.ndarray], float],
     x0: np.ndarray,
     method: str,
     tol: float,
@@ -13,180 +106,83 @@ def non_linear_min(
     printout: bool,
 ) -> Tuple[np.ndarray, int, int, float]:
     """
-    Nonlinear optimization using DFP or BFGS quasi-Newton methods.
-
-    Args:
-        f : Callable
-            Objective function
-        x0 : np.ndarray
-            Initial guess
-        method : str
-            "DFP" or "BFGS"
-        tol : float
-            Convergence tolerance for gradient norm
-        restart : bool
-            If True, reset Hessian approximation to identity if something goes wrong
-        printout : bool
-            If True, print iteration information
-
-    Returns:
-        x : np.ndarray
-            Minimum x*
-        n_iter : int
-            Number of iterations
-        n_fval : int
-            Number of function evaluations
-        gnorm : float
-            Norm of function gradient at x*
+    quasi-newton minimiser using DFP or BFGS.
+    returns (x, N_eval, N_iter, normg).  #matches assignment.
     """
-    
-    c1 = 1e-4
-    c2 = 0.9
+    f = _FuncCounter(f_orig)  #single authoritative evaluation counter
+    x = np.asarray(x0, dtype=float).copy()
+    if x.ndim != 1:
+        raise TypeError("non_linear_min: x0 must be a 1D numpy array.")
+    if tol <= 0:
+        raise ValueError("non_linear_min: tol must be positive.")
 
-    n_iter = 0
+    m = method.strip().upper()  #accept 'DFP'/'BFGS' in any case
+    if m not in {"DFP", "BFGS"}:
+        raise ValueError("non_linear_min: method must be 'DFP' or 'BFGS'.")
+
+    n = x.size
+    H = np.eye(n)  #inverse-Hessian approximation
+
     max_iter = 1000
+    eps = 1e-12
 
-    calls=0
-    # HELPER FUNCTIONS
-    norm = np.linalg.norm
+    #"restart regularly" now means periodic resets, not only on failure
+    restart_period = 10 * max(1, n)
 
-    def _hesse(s, y, H, mthd) -> np.ndarray:
-        if mthd == "dfp":
-            Hy = H @ y
-            sTy = np.dot(s, y)
-            yTHy = np.dot(y, Hy)
-
-            if sTy > 1e-12:
-                return H - np.outer(Hy, Hy) / yTHy + np.outer(s, s) / sTy
-            return None  # if not pos. def.
-        if mthd == "bfgs":
-            rho = 1.0 / np.dot(y, s)
-
-            if rho > 0:
-                I_minus_rhosyT = np.eye(n) - rho * np.outer(s, y)
-                return I_minus_rhosyT @ H @ I_minus_rhosyT.T + rho * np.outer(s, s)
-            return None  # if not pos. def.
-        raise ValueError(f"Unknown update formula: {mthd}")
-
-    def _line_search(f, x, p, g, lcalls) -> float:
-        """Line search function that satisfies Wolfe conditions, from Nocedal&Wright 2006 p. 59-60
-        Args:
-            f: Objective function
-            x: Current point
-            p: Search direction
-            fx: Objective function value at x
-            g: Objective function gradient at x
-        """
-        alpha = 1
-        phi = lambda alpha: f(x + alpha * p)
-
-        def _zoom(alpha_lo, alpha_hi,phi_alpha_lo, phi_0, dphi_0, zcalls):
-
-            for _ in range(max_iter):
-                alpha_j = (alpha_lo + alpha_hi) / 2
-                phi_j = phi(alpha_j)
-                zcalls+=1
-                if phi_j > phi_0 + c1 * alpha_j * dphi_0 or phi_j >= phi_alpha_lo:
-                    alpha_hi = alpha_j
-                else:
-                    dphi_j = np.dot(grad_c(f, x + alpha_j * p), p)
-                    zcalls+=2*n
-                    dphi_lo = np.dot(grad_c(f, x + alpha_lo * p), p)
-                    zcalls+=2*n
-                    if np.abs(dphi_j) <= -c2 * dphi_lo:
-                        return alpha_j, zcalls
-
-                    if dphi_j * (alpha_hi - alpha_lo) >= 0:
-                        alpha_hi = alpha_lo
-
-                    alpha_lo = alpha_j
-
-            return alpha_lo, zcalls
-
-        dphi_0 = np.dot(g, p)
-        alpha_prev = 0.0
-        phi_prev = phi_0 = phi(0)
-        lcalls+=1
-        for i in range(max_iter):
-            phi_i = phi(alpha)
-            lcalls+=1
-            if phi_i > phi_0 + c1 * alpha * dphi_0 or (i > 0 and phi_i >= phi_prev):
-                return _zoom(alpha_prev, alpha,phi_prev, phi_0,dphi_0, lcalls)
-
-            dphi_i = np.dot(grad_c(f, x + alpha * p), p)
-            lcalls+=2*n
-            if np.abs(dphi_i) <= -c2 * dphi_0:
-                return alpha, lcalls
-
-            if dphi_i >= 0:
-                return _zoom(alpha, alpha_prev,phi_prev,phi_0, dphi_0, lcalls)
-
-            alpha_prev = alpha
-            phi_prev = phi_i
-            alpha = alpha * 1.5
-
-        return alpha, lcalls
-
-    x = x0.copy()
-    n = len(x)
-
+    fx = f(x)
     g = grad_c(f, x)
-    calls+=2*n
-
-    H = np.eye(n)
+    normg = float(np.linalg.norm(g))
 
     if printout:
-        print(f"Iteration {n_iter}: f(x) = {f(x):.6e}, ||g|| = {np.linalg.norm(g):.6e}")
-        calls+=1
+        print("iter  x  f(x)  norm(grad)  ls fun evals  lamb")  #matches required printout fields
+        print(f"{0:4d}  {x}  {fx:.6e}  {normg:.6e}  {0:11d}  {0.0:.6e}")
 
-    # Main optimization loop
-    while norm(g) > tol and n_iter < max_iter:
+    k = 0
+    while normg > tol and k < max_iter:
+        if restart and (k > 0) and (k % restart_period == 0):
+            H = np.eye(n)  #periodic restart
+
+        #search direction
         p = -H @ g
-        alpha,calls= _line_search(f, x, p, g, calls)
+        if float(np.dot(p, g)) >= 0.0:
+            H = np.eye(n)  #force descent if numerical issues
+            p = -g
 
-        x_new = x + alpha * p
-        g_new = grad_c(f, x_new)
-        calls+=2*n
+        #strong wolfe line search (returns g at new point so we reuse it)
+        alpha, fx_new, g_new, ls_evals = _strong_wolfe_line_search(f, x, fx, g, p)
 
         s = alpha * p
         y = g_new - g
 
-        H = _hesse(s, y, H, method)
-        if H is None:
-            if restart:
-                H = np.eye(n)
-            else:
-                raise RuntimeError("Hesse matrix is not pos. def, consider restarting")
+        sTy = float(np.dot(s, y))
 
-        x = x_new
-        g = g_new
-        n_iter += 1
+        #update H (inverse hessian)
+        if m == "BFGS":
+            if sTy > eps:
+                rho = 1.0 / sTy
+                I = np.eye(n)
+                V = I - rho * np.outer(s, y)
+                H = V @ H @ V.T + rho * np.outer(s, s)
+            else:
+                if restart:
+                    H = np.eye(n)  #if curvature fails, restart instead of corrupting H
+        else:  #DFP
+            Hy = H @ y
+            yTHy = float(np.dot(y, Hy))
+            if sTy > eps and yTHy > eps:
+                H = H + (np.outer(s, s) / sTy) - (np.outer(Hy, Hy) / yTHy)
+            else:
+                if restart:
+                    H = np.eye(n)  #curvature/denominator safety
+
+        #advance
+        x, fx, g = x + s, fx_new, g_new
+        normg = float(np.linalg.norm(g))
+        k += 1
 
         if printout:
-            print(
-                f"Iteration {n_iter}: f(x) = {f(x):.6e}, ||g|| = {np.linalg.norm(g):.6e}, alpha = {alpha}"
-            )
-            calls+=1
-    if printout:
-        if n_iter==max_iter:
-            print("="*10+"Minimization terminated unsucessfully" + "="*10)
-        else:
-            print("="*10+"Minimization finished" + "="*10)
-            print(f"x*={x}")
-            print(f"f(x*)={f(x)}")
-            calls+=1
-            print(f"2-norm of g={norm(g)}")
-            print(f"Minimization steps: {n_iter}")
-            print(f"Function calls: {calls+1}")
-            print("="*41)
-    return (
-        x,
-        calls+1,
-        n_iter,
-        f(x),
-    )
+            print(f"{k:4d}  {x}  {fx:.6e}  {normg:.6e}  {ls_evals:11d}  {alpha:.6e}")
 
-
-if __name__ == "__main__":
-    f = lambda x: np.sum(x**2)
-    print(non_linear_min(rosenbrock, np.random.rand(2) * 100, "bfgs", 1e-5, True, True))
+    N_eval = int(f.calls)
+    N_iter = int(k)
+    return x, N_eval, N_iter, normg  #returns normg (not f(x))
